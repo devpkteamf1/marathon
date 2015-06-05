@@ -63,6 +63,7 @@ class ForwardToLeaderIntegrationTest extends IntegrationFunSuite with BeforeAndA
     val appFacade = new AppMockFacade()
     val result = appFacade.custom("/hello/crash")("localhost", port = ports.head)
     assert(result.originalResponse.status.intValue == 500)
+    assert(result.entityString == "Error")
   }
 
   test("forwarding internal server error") {
@@ -72,6 +73,7 @@ class ForwardToLeaderIntegrationTest extends IntegrationFunSuite with BeforeAndA
     val appFacade = new AppMockFacade()
     val result = appFacade.custom("/hello/crash")("localhost", port = ports(1))
     assert(result.originalResponse.status.intValue == 500)
+    assert(result.entityString == "Error")
   }
 
   test("forwarding connection failed") {

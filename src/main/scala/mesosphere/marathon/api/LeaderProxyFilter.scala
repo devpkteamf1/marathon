@@ -1,22 +1,21 @@
 package mesosphere.marathon.api
 
-import java.util
+import java.io.{ IOException, InputStream, OutputStream }
+import java.net.{ UnknownServiceException, ConnectException, HttpURLConnection, URL }
+import javax.inject.Named
+import javax.servlet._
+import javax.servlet.http.{ HttpServletRequest, HttpServletResponse }
 
+import com.google.inject.Inject
 import mesosphere.chaos.http.HttpConf
+import mesosphere.marathon.io.IO
+import mesosphere.marathon.{ LeaderProxyConf, ModuleNames }
 import org.apache.http.HttpStatus
+import org.apache.log4j.Logger
 import org.slf4j.LoggerFactory
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
-import com.google.inject.Inject
-import java.net.{ ConnectException, HttpURLConnection, URL }
-import java.io.{ OutputStream, InputStream }
-import javax.inject.Named
-import javax.servlet._
-import javax.servlet.http.{ HttpServletResponse, HttpServletRequest }
-import mesosphere.marathon.{ LeaderProxyConf, ModuleNames }
-import org.apache.log4j.Logger
-
 import scala.util.Try
 import scala.util.control.NonFatal
 
@@ -158,57 +157,57 @@ class JavaUrlConnectionRequestForwarder @Inject() (
 
   override def forward(url: URL, request: HttpServletRequest, response: HttpServletResponse): Unit = {
 
-    val viaOpt = Option(request.getHeaders(HEADER_VIA)).map(_.asScala.toVector)
-    log.debug("viaOpt {}", viaOpt)
-    if (viaOpt.exists(_.contains(viaValue))) {
-      log.error("Prevent proxy cycle, rejecting request")
-      response.sendError(HttpStatus.SC_BAD_GATEWAY, ERROR_STATUS_LOOP)
-      return
+    def hasProxyLoop: Boolean = {
+      val viaOpt = Option(request.getHeaders(HEADER_VIA)).map(_.asScala.toVector)
+      viaOpt.exists(_.contains(viaValue))
     }
 
-    val method = request.getMethod
+    def copyRequestHeadersToConnection(leaderConnection: HttpURLConnection, request: HttpServletRequest): Unit = {
+      // getHeaderNames() and getHeaders() are known to return null, see:
+      //http://docs.oracle.com/javaee/6/api/javax/servlet/http/HttpServletRequest.html#getHeaders(java.lang.String)
+      val names = Option(request.getHeaderNames).map(_.asScala).getOrElse(Nil)
+      for {
+        name <- names
+        // Reverse proxies commonly filter these headers: connection, host.
+        //
+        // The connection header is removed since it may make sense to persist the connection
+        // for further requests even if this single client will stop using it.
+        //
+        // The host header is used to choose the correct virtual host and should be set to the hostname
+        // of the URL for HTTP 1.1. Thus we do not preserve it, even though Marathon does not care.
+        if !name.equalsIgnoreCase("host") && !name.equalsIgnoreCase("connection")
+        headerValues <- Option(request.getHeaders(name))
+        headerValue <- headerValues.asScala
+      } {
+        log.debug(s"addRequestProperty $name: $headerValue")
+        leaderConnection.addRequestProperty(name, headerValue)
+      }
 
-    log.info(s"Proxying request to $method $url from $myHostPort")
-
-    val leaderConnection: HttpURLConnection = url.openConnection().asInstanceOf[HttpURLConnection]
-
-    leaderConnection.setConnectTimeout(leaderProxyConf.leaderProxyConnectionTimeout())
-    leaderConnection.setReadTimeout(leaderProxyConf.leaderProxyReadTimeout())
-
-    // getHeaderNames() and getHeaders() are known to return null, see:
-    //http://docs.oracle.com/javaee/6/api/javax/servlet/http/HttpServletRequest.html#getHeaders(java.lang.String)
-    val names = Option(request.getHeaderNames).map(_.asScala).getOrElse(Nil)
-    for {
-      name <- names if !name.equalsIgnoreCase("host") && !name.equalsIgnoreCase("connection")
-      headerValues <- Option(request.getHeaders(name))
-      headerValue <- headerValues.asScala
-    } {
-      log.debug(s"addRequestProperty $name: $headerValue")
-      leaderConnection.addRequestProperty(name, headerValue)
+      leaderConnection.addRequestProperty(HEADER_VIA, viaValue)
     }
 
-    leaderConnection.addRequestProperty(HEADER_VIA, viaValue)
+    def copyRequestBodyToConnection(leaderConnection: HttpURLConnection, request: HttpServletRequest): Unit = {
+      request.getMethod match {
+        case "GET" | "HEAD" | "DELETE" =>
+          leaderConnection.setDoOutput(false)
+        case _ =>
+          leaderConnection.setDoOutput(true)
 
-    leaderConnection.setRequestMethod(method)
-
-    log.debug("request properties {}", leaderConnection.getRequestProperties.asScala)
-
-    method match {
-      case "GET" | "HEAD" | "DELETE" =>
-        leaderConnection.setDoOutput(false)
-      case _ =>
-        leaderConnection.setDoOutput(true)
-
-        val proxyOutputStream = leaderConnection.getOutputStream
-        try {
-          copy(request.getInputStream, proxyOutputStream)
-        }
-        finally {
-          Try(proxyOutputStream.close())
-        }
+          IO.using(request.getInputStream) { requestInput =>
+            IO.using(leaderConnection.getOutputStream) { proxyOutputStream =>
+              copy(request.getInputStream, proxyOutputStream)
+            }
+          }
+      }
     }
 
-    try {
+    def copyRequestToConnection(leaderConnection: HttpURLConnection, request: HttpServletRequest): Unit = {
+      leaderConnection.setRequestMethod(request.getMethod)
+      copyRequestHeadersToConnection(leaderConnection, request)
+      copyRequestBodyToConnection(leaderConnection, request)
+    }
+
+    def copyConnectionResponse(leaderConnection: HttpURLConnection, response: HttpServletResponse): Unit = {
       val status = leaderConnection.getResponseCode
       response.setStatus(status)
 
@@ -223,31 +222,62 @@ class JavaUrlConnectionRequestForwarder @Inject() (
           }
         }
       }
-      copy(leaderConnection.getInputStream, response.getOutputStream)
+
+      IO.using(response.getOutputStream) { output =>
+        try {
+          IO.using(leaderConnection.getInputStream) { connectionInput => copy(connectionInput, output) }
+        }
+        catch {
+          case e: IOException =>
+            log.debug("got exception response, this is maybe an error code", e)
+            IO.using(leaderConnection.getErrorStream) { connectionError => copy(connectionError, output) }
+        }
+      }
     }
-    catch {
-      case connException: ConnectException =>
-        response.sendError(HttpStatus.SC_BAD_GATEWAY, ERROR_STATUS_CONNECTION_REFUSED)
-      case NonFatal(e) =>
-        copy(leaderConnection.getErrorStream, response.getOutputStream)
+
+    log.info(s"Proxying request to ${request.getMethod} $url from $myHostPort")
+
+    try {
+      if (hasProxyLoop) {
+        log.error("Prevent proxy cycle, rejecting request")
+        response.sendError(HttpStatus.SC_BAD_GATEWAY, ERROR_STATUS_LOOP)
+      }
+      else {
+        val leaderConnection: HttpURLConnection = url.openConnection().asInstanceOf[HttpURLConnection]
+        try {
+          leaderConnection.setConnectTimeout(leaderProxyConf.leaderProxyConnectionTimeout())
+          leaderConnection.setReadTimeout(leaderProxyConf.leaderProxyReadTimeout())
+
+          copyRequestToConnection(leaderConnection, request)
+          copyConnectionResponse(leaderConnection, response)
+        }
+        catch {
+          case connException: ConnectException =>
+            response.sendError(HttpStatus.SC_BAD_GATEWAY, ERROR_STATUS_CONNECTION_REFUSED)
+        }
+        finally {
+          Try(leaderConnection.getInputStream.close())
+          Try(leaderConnection.getErrorStream.close())
+        }
+      }
     }
     finally {
+      Try(request.getInputStream.close())
       Try(response.getOutputStream.close())
-      Try(leaderConnection.getInputStream.close())
-      Try(leaderConnection.getErrorStream.close())
     }
+
   }
 
-  private[this] def copy(inputOrNull: InputStream, outputOrNull: OutputStream): Unit = {
-    for {
-      input <- Option(inputOrNull)
-      output <- Option(outputOrNull)
-    } {
-      val bytes = new Array[Byte](1024)
-      Iterator
-        .continually(input.read(bytes))
-        .takeWhile(_ != -1)
-        .foreach(read => output.write(bytes, 0, read))
+  def copy(nullableIn: InputStream, nullableOut: OutputStream): Unit = {
+    try {
+      for {
+        in <- Option(nullableIn)
+        out <- Option(nullableOut)
+      } IO.transfer(in, out, close = false)
+    }
+    catch {
+      case e: UnknownServiceException =>
+        log.warn("unexpected unknown service exception", e)
     }
   }
 }
