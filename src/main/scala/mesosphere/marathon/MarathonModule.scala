@@ -19,6 +19,7 @@ import mesosphere.marathon.event.EventModule
 import mesosphere.marathon.event.http.HttpEventStreamActor
 import mesosphere.marathon.health.{ HealthCheckManager, MarathonHealthCheckManager }
 import mesosphere.marathon.io.storage.StorageProvider
+import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state._
 import mesosphere.marathon.tasks.{ TaskIdUtil, TaskQueue, TaskTracker, _ }
 import mesosphere.marathon.upgrade.DeploymentPlan
@@ -68,6 +69,8 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     bind(classOf[String])
       .annotatedWith(Names.named(ModuleNames.NAMED_SERVER_SET_PATH))
       .toInstance(conf.zooKeeperServerSetPath)
+
+    bind(classOf[Metrics]).in(Scopes.SINGLETON)
 
     // If running in single scheduler mode, this node is the leader.
     val leader = new AtomicBoolean(!conf.highlyAvailable())
@@ -169,14 +172,14 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
   def provideTaskFailureRepository(
     state: State,
     conf: MarathonConf,
-    registry: MetricRegistry): TaskFailureRepository = {
+    metrics: Metrics): TaskFailureRepository = {
     import mesosphere.marathon.state.PathId
     import org.apache.mesos.{ Protos => mesos }
     new TaskFailureRepository(
       new MarathonStore[TaskFailure](
         conf,
         state,
-        registry,
+        metrics,
         () => TaskFailure(
           PathId.empty,
           mesos.TaskID.newBuilder().setValue("").build,
@@ -192,11 +195,11 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
   def provideAppRepository(
     state: State,
     conf: MarathonConf,
-    registry: MetricRegistry): AppRepository =
+    metrics: Metrics): AppRepository =
     new AppRepository(
-      new MarathonStore[AppDefinition](conf, state, registry, () => AppDefinition.apply()),
+      new MarathonStore[AppDefinition](conf, state, metrics, () => AppDefinition.apply()),
       maxVersions = conf.zooKeeperMaxVersions.get,
-      registry
+      metrics
     )
 
   @Provides
@@ -205,11 +208,11 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     state: State,
     appRepository: AppRepository,
     conf: MarathonConf,
-    registry: MetricRegistry): GroupRepository =
+    metrics: Metrics): GroupRepository =
     new GroupRepository(
-      new MarathonStore[Group](conf, state, registry, () => Group.empty, "group:"),
+      new MarathonStore[Group](conf, state, metrics, () => Group.empty, "group:"),
       appRepository, conf.zooKeeperMaxVersions.get,
-      registry
+      metrics
     )
 
   @Provides
@@ -217,11 +220,11 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
   def provideDeploymentRepository(
     state: State,
     conf: MarathonConf,
-    registry: MetricRegistry): DeploymentRepository =
+    metrics: Metrics): DeploymentRepository =
     new DeploymentRepository(
-      new MarathonStore[DeploymentPlan](conf, state, registry, () => DeploymentPlan.empty, "deployment:"),
+      new MarathonStore[DeploymentPlan](conf, state, metrics, () => DeploymentPlan.empty, "deployment:"),
       conf.zooKeeperMaxVersions.get,
-      registry
+      metrics
     )
 
   @Provides
@@ -244,9 +247,9 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     state: State,
     appRepo: AppRepository,
     groupRepo: GroupRepository,
-    registry: MetricRegistry,
+    metrics: Metrics,
     config: MarathonConf): Migration =
-    new Migration(state, appRepo, groupRepo, config, registry)
+    new Migration(state, appRepo, groupRepo, config, metrics)
 
   @Provides
   @Singleton
